@@ -1,3 +1,22 @@
+## [0.2.0] - 2026-04-28 - Engine Contracts & Standard Port Adapters
+
+### Added
+- Five standard port adapters implementing `mcp_bundle` Contract Layer — `MetricsPortAdapter`, `AppraisalPortAdapter`, `DecisionPortAdapter`, `ExpressionPortAdapter`, `ProfileSummariesPortAdapter`.
+- Internal engine contracts under `src/engines/` — `AppraisalEnginePort`, `DecisionEnginePort`, `ExpressionEnginePort`, with `EnginePorts` container.
+
+### Changed
+- `ProfileApplicationRuntime` → `ProfileRuntime`, `ProfilePorts` → `EnginePorts` (no back-compat aliases).
+- `AppraisalEngine` consumes `FactsPort` directly via `FactQuery` / `FactRecord`; required `workspaceId` construction field.
+- `RuntimeProfileContext` carries `facts` / `patterns` / `summaries` / `llm` standard ports.
+- New dependency: `mcp_bundle ^0.3.0`.
+
+### Removed
+- Legacy `src/ports/` directory in full (replaced by engine ports + Contract Layer adapters).
+- Legacy adapters, factgraph plumbing, runtime hooks, and the text-renderer profile runtime.
+- All typedef back-compat aliases.
+
+---
+
 ## [0.1.0] - Initial Release
 
 ### Added

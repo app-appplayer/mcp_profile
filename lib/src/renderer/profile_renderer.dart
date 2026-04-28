@@ -231,9 +231,6 @@ class ProfileRenderer {
     if (value == null) return '';
     if (value is String) return value;
     if (value is List) return value.join(', ');
-    if (value is Map) return value.entries
-        .map((e) => '${e.key}: ${e.value}')
-        .join(', ');
     return value.toString();
   }
 

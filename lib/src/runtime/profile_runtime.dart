@@ -1,446 +1,508 @@
-/// Profile Runtime - Main runtime for profile execution.
+/// Profile Runtime - Unified runtime per docs/03_DDD/core-runtime.md v0.2.0.
 ///
-/// Provides the core runtime for rendering profiles with context,
-/// applying appraisal and decision policies, and formatting output.
+/// Implements the full profile application pipeline:
+/// 1. Appraisal - Compute metrics from context
+/// 2. Decision - Evaluate policies and get guidance
+/// 3. Expression - Determine communication style
+/// 4. Formatting - Apply style to content
 library;
 
+import '../appraisal/appraisal_result.dart';
+import '../appraisal/metric_definition.dart';
+import '../decision/decision_guidance.dart';
+import '../decision/decision_policy.dart';
 import '../definition/profile.dart';
-import '../bundle/profile_bundle.dart';
-import '../ports/profile_ports.dart';
-import '../ports/profile_port.dart';
-import '../ports/expression_port.dart';
-import '../appraisal/profile_appraisal.dart';
-import '../decision/profile_decision.dart';
-import 'runtime_hooks.dart';
+import '../engines/appraisal_engine_port.dart';
+import '../engines/engine_ports.dart';
+import '../engines/expression_engine_port.dart' as engines;
+import '../expression/expression_policy.dart';
+import '../expression/expression_style.dart';
+import '../registry/profile_registry.dart';
+import 'runtime_context.dart';
 
-/// Main runtime for profile execution.
-class ProfileRuntime {
-  /// Port container.
-  final ProfilePorts ports;
+// =============================================================================
+// ProfileApplicationResult (§5)
+// =============================================================================
 
-  /// Runtime hooks.
-  final ProfileRuntimeHook hook;
+/// Complete profile application result per design/03-runtime.md §5.
+class ProfileApplicationResult {
+  /// Profile ID that was applied.
+  final String profileId;
 
-  /// Profile appraiser.
-  final ProfileAppraiser? appraiser;
+  /// Context ID for this execution.
+  final String contextId;
 
-  /// Profile decision engine.
-  final ProfileDecisionEngine? decisionEngine;
+  /// Appraisal result with metrics.
+  final AppraisalResult appraisal;
 
-  /// Inheritance resolver.
-  final ProfileInheritanceResolver _inheritanceResolver;
+  /// Decision guidance from policy evaluation.
+  final DecisionGuidance decision;
 
-  ProfileRuntime({
-    required this.ports,
-    ProfileRuntimeHook? hook,
-    this.appraiser,
-    this.decisionEngine,
-  })  : hook = hook ?? const NoOpProfileHook(),
-        _inheritanceResolver = ProfileInheritanceResolver();
+  /// Expression style determined by policies.
+  final ExpressionStyle expression;
 
-  /// Execute profile rendering with full pipeline.
-  Future<ProfileExecutionResult> execute({
-    required String profileId,
-    required ProfileContext context,
-    ProfileExecutionOptions? options,
-  }) async {
-    final startTime = DateTime.now();
-
-    try {
-      await hook.onExecutionStart(profileId, context);
-
-      // Get profile
-      final profile = await ports.storage.getProfile(profileId);
-      if (profile == null) {
-        return ProfileExecutionResult.failure(
-          error: 'Profile not found: $profileId',
-          duration: DateTime.now().difference(startTime),
-        );
-      }
-
-      // Execute with profile
-      return await executeWithProfile(
-        profile: profile,
-        context: context,
-        options: options,
-      );
-    } catch (e, st) {
-      await hook.onError(e, st);
-      return ProfileExecutionResult.failure(
-        error: e.toString(),
-        duration: DateTime.now().difference(startTime),
-      );
-    }
-  }
-
-  /// Execute with a specific profile.
-  Future<ProfileExecutionResult> executeWithProfile({
-    required Profile profile,
-    required ProfileContext context,
-    ProfileExecutionOptions? options,
-  }) async {
-    final startTime = DateTime.now();
-    final opts = options ?? const ProfileExecutionOptions();
-
-    try {
-      await hook.onProfileLoaded(profile);
-
-      // Apply appraisal if enabled
-      ProfileAppraisal? appraisal;
-      if (opts.enableAppraisal && appraiser != null) {
-        appraisal = appraiser!.appraise(profile);
-        await hook.onAppraisalComplete(appraisal);
-
-        if (!appraisal.passed(threshold: opts.appraisalThreshold)) {
-          if (opts.failOnLowAppraisal) {
-            return ProfileExecutionResult.failure(
-              error: 'Profile appraisal failed: ${appraisal.overallScore}',
-              appraisal: appraisal,
-              duration: DateTime.now().difference(startTime),
-            );
-          }
-        }
-      }
-
-      // Apply section decisions
-      SectionDecision? sectionDecision;
-      if (opts.enableDecision && decisionEngine != null) {
-        sectionDecision = decisionEngine!.decideSections(profile, context);
-        await hook.onDecisionComplete(sectionDecision);
-      }
-
-      // Render profile
-      final rendered = await ports.render.render(
-        profile: profile,
-        context: context.toMap(),
-        options: RenderOptions(
-          maxLength: opts.maxContentLength,
-          includeSections: opts.includeSections,
-          excludeSections: opts.excludeSections,
-          includeCapabilities: opts.includeCapabilities,
-          variables: context.variables,
-        ),
-      );
-
-      await hook.onRenderComplete(rendered);
-
-      // Apply expression formatting if enabled
-      String formattedContent = rendered.systemPrompt;
-      if (opts.enableFormatting && opts.expressionStyle != null) {
-        final formatted = await ports.expression.format(
-          content: formattedContent,
-          style: opts.expressionStyle!,
-          context: FormattingContext(
-            userPreferences: context.user,
-            conversationContext: context.session,
-          ),
-        );
-        formattedContent = formatted.content;
-      }
-
-      await hook.onExecutionComplete(profile.id);
-
-      return ProfileExecutionResult.success(
-        profileId: profile.id,
-        profileVersion: profile.version,
-        content: formattedContent,
-        instructions: rendered.instructions,
-        activeCapabilities: rendered.activeCapabilities,
-        appraisal: appraisal,
-        sectionDecision: sectionDecision,
-        duration: DateTime.now().difference(startTime),
-        metadata: {
-          'sectionsIncluded': sectionDecision?.included.length ?? profile.sections.length,
-          'sectionsExcluded': sectionDecision?.excluded.length ?? 0,
-          ...rendered.metadata,
-        },
-      );
-    } catch (e, st) {
-      await hook.onError(e, st);
-      return ProfileExecutionResult.failure(
-        error: e.toString(),
-        duration: DateTime.now().difference(startTime),
-      );
-    }
-  }
-
-  /// Select and execute best profile from candidates.
-  Future<ProfileExecutionResult> selectAndExecute({
-    required List<String> candidateIds,
-    required ProfileContext context,
-    ProfileExecutionOptions? options,
-    String? preferredId,
-  }) async {
-    final startTime = DateTime.now();
-
-    try {
-      // Select profile
-      final selection = await ports.selection.selectProfile(
-        candidateIds: candidateIds,
-        context: context.toMap(),
-        preferredId: preferredId,
-      );
-
-      if (!selection.hasSelection) {
-        return ProfileExecutionResult.failure(
-          error: 'No suitable profile found: ${selection.reason}',
-          duration: DateTime.now().difference(startTime),
-        );
-      }
-
-      // Execute selected profile
-      final result = await execute(
-        profileId: selection.selectedId!,
-        context: context,
-        options: options,
-      );
-
-      // Include selection info in metadata
-      return result.copyWith(
-        metadata: {
-          ...result.metadata,
-          'selectionConfidence': selection.confidence,
-          'selectionReason': selection.reason,
-          'alternatives': selection.alternatives,
-        },
-      );
-    } catch (e, st) {
-      await hook.onError(e, st);
-      return ProfileExecutionResult.failure(
-        error: e.toString(),
-        duration: DateTime.now().difference(startTime),
-      );
-    }
-  }
-
-  /// Execute with profile bundle.
-  Future<ProfileExecutionResult> executeFromBundle({
-    required ProfileBundle bundle,
-    required ProfileContext context,
-    String? profileId,
-    ProfileExecutionOptions? options,
-  }) async {
-    final startTime = DateTime.now();
-
-    try {
-      // Get profile from bundle
-      Profile? profile;
-      if (profileId != null) {
-        profile = bundle.getProfile(profileId);
-      } else {
-        profile = bundle.defaultProfile;
-      }
-
-      if (profile == null) {
-        return ProfileExecutionResult.failure(
-          error: profileId != null
-              ? 'Profile "$profileId" not found in bundle'
-              : 'No default profile in bundle',
-          duration: DateTime.now().difference(startTime),
-        );
-      }
-
-      // Resolve inheritance
-      final resolved = _inheritanceResolver.resolve(profile, bundle);
-
-      // Execute
-      return await executeWithProfile(
-        profile: resolved,
-        context: context,
-        options: options,
-      );
-    } catch (e, st) {
-      await hook.onError(e, st);
-      return ProfileExecutionResult.failure(
-        error: e.toString(),
-        duration: DateTime.now().difference(startTime),
-      );
-    }
-  }
-}
-
-/// Options for profile execution.
-class ProfileExecutionOptions {
-  /// Whether to enable appraisal.
-  final bool enableAppraisal;
-
-  /// Minimum appraisal score threshold.
-  final double appraisalThreshold;
-
-  /// Whether to fail on low appraisal.
-  final bool failOnLowAppraisal;
-
-  /// Whether to enable section decision.
-  final bool enableDecision;
-
-  /// Whether to enable expression formatting.
-  final bool enableFormatting;
-
-  /// Expression style for formatting.
-  final ExpressionStyle? expressionStyle;
-
-  /// Maximum content length.
-  final int? maxContentLength;
-
-  /// Sections to include.
-  final List<String>? includeSections;
-
-  /// Sections to exclude.
-  final List<String>? excludeSections;
-
-  /// Whether to include capabilities.
-  final bool includeCapabilities;
-
-  const ProfileExecutionOptions({
-    this.enableAppraisal = true,
-    this.appraisalThreshold = 70.0,
-    this.failOnLowAppraisal = false,
-    this.enableDecision = true,
-    this.enableFormatting = false,
-    this.expressionStyle,
-    this.maxContentLength,
-    this.includeSections,
-    this.excludeSections,
-    this.includeCapabilities = true,
-  });
-
-  /// Create default options.
-  static const ProfileExecutionOptions defaults = ProfileExecutionOptions();
-
-  /// Create minimal options (no appraisal, no decision).
-  static const ProfileExecutionOptions minimal = ProfileExecutionOptions(
-    enableAppraisal: false,
-    enableDecision: false,
-    enableFormatting: false,
-  );
-}
-
-/// Result of profile execution.
-class ProfileExecutionResult {
-  /// Whether execution succeeded.
-  final bool success;
-
-  /// Profile ID (if success).
-  final String? profileId;
-
-  /// Profile version (if success).
-  final String? profileVersion;
-
-  /// Rendered content (if success).
-  final String? content;
-
-  /// Additional instructions (if success).
-  final String? instructions;
-
-  /// Active capabilities.
-  final List<String> activeCapabilities;
-
-  /// Appraisal result (if enabled).
-  final ProfileAppraisal? appraisal;
-
-  /// Section decision (if enabled).
-  final SectionDecision? sectionDecision;
-
-  /// Error message (if failure).
-  final String? error;
-
-  /// Execution duration.
-  final Duration duration;
+  /// Formatted response if content was provided.
+  final FormattedResponse? formatted;
 
   /// Execution metadata.
-  final Map<String, dynamic> metadata;
+  final ProfileApplicationMetadata metadata;
 
-  const ProfileExecutionResult({
-    required this.success,
-    this.profileId,
-    this.profileVersion,
-    this.content,
-    this.instructions,
-    this.activeCapabilities = const [],
-    this.appraisal,
-    this.sectionDecision,
-    this.error,
-    required this.duration,
-    this.metadata = const {},
+  const ProfileApplicationResult({
+    required this.profileId,
+    required this.contextId,
+    required this.appraisal,
+    required this.decision,
+    required this.expression,
+    this.formatted,
+    required this.metadata,
+  });
+}
+
+/// Metadata for profile application execution per design/03-runtime.md §5.
+class ProfileApplicationMetadata {
+  /// When the application started.
+  final DateTime startedAt;
+
+  /// When the application completed.
+  final DateTime completedAt;
+
+  /// Profile version used.
+  final String profileVersion;
+
+  const ProfileApplicationMetadata({
+    required this.startedAt,
+    required this.completedAt,
+    required this.profileVersion,
   });
 
-  /// Create success result.
-  factory ProfileExecutionResult.success({
-    required String profileId,
-    required String profileVersion,
-    required String content,
-    String? instructions,
-    List<String> activeCapabilities = const [],
-    ProfileAppraisal? appraisal,
-    SectionDecision? sectionDecision,
-    required Duration duration,
-    Map<String, dynamic> metadata = const {},
-  }) {
-    return ProfileExecutionResult(
-      success: true,
-      profileId: profileId,
-      profileVersion: profileVersion,
-      content: content,
-      instructions: instructions,
-      activeCapabilities: activeCapabilities,
-      appraisal: appraisal,
-      sectionDecision: sectionDecision,
-      duration: duration,
-      metadata: metadata,
-    );
-  }
+  /// Get execution duration.
+  Duration get duration => completedAt.difference(startedAt);
+}
 
-  /// Create failure result.
-  factory ProfileExecutionResult.failure({
-    required String error,
-    ProfileAppraisal? appraisal,
-    required Duration duration,
-    Map<String, dynamic> metadata = const {},
-  }) {
-    return ProfileExecutionResult(
-      success: false,
-      error: error,
-      appraisal: appraisal,
-      duration: duration,
-      metadata: metadata,
-    );
-  }
+/// Re-export FormattedResponse from expression port.
+typedef FormattedResponse = engines.FormattedResponse;
 
-  /// Copy with modifications.
-  ProfileExecutionResult copyWith({
-    bool? success,
-    String? profileId,
-    String? profileVersion,
-    String? content,
-    String? instructions,
-    List<String>? activeCapabilities,
-    ProfileAppraisal? appraisal,
-    SectionDecision? sectionDecision,
-    String? error,
-    Duration? duration,
-    Map<String, dynamic>? metadata,
-  }) {
-    return ProfileExecutionResult(
-      success: success ?? this.success,
-      profileId: profileId ?? this.profileId,
-      profileVersion: profileVersion ?? this.profileVersion,
-      content: content ?? this.content,
-      instructions: instructions ?? this.instructions,
-      activeCapabilities: activeCapabilities ?? this.activeCapabilities,
-      appraisal: appraisal ?? this.appraisal,
-      sectionDecision: sectionDecision ?? this.sectionDecision,
-      error: error ?? this.error,
-      duration: duration ?? this.duration,
-      metadata: metadata ?? this.metadata,
-    );
-  }
+// =============================================================================
+// ProfileRuntime (§4)
+// =============================================================================
 
-  /// Get full prompt content.
-  String? get fullPrompt {
-    if (content == null) return null;
-    if (instructions != null && instructions!.isNotEmpty) {
-      return '$content\n\n$instructions';
+/// Profile application runtime per docs/03_DDD/core-runtime.md v0.2.0.
+///
+/// Spec-compliant runtime that implements the full pipeline:
+/// appraise → decision → expression → formatting. Uses [EnginePorts] for
+/// delegation to the internal engine contracts defined in
+/// `src/engines/`.
+class ProfileRuntime {
+  /// Profile registry for loading profiles.
+  final ProfileRegistry registry;
+
+  /// Engine port container — the three internal engine contracts plus the
+  /// optional consumed standard ports (FactsPort/PatternsPort/
+  /// SummariesPort/LlmPort).
+  final EnginePorts engines;
+
+  /// Runtime hooks.
+  final List<ProfileRuntimeHook>? hooks;
+
+  ProfileRuntime({
+    required this.registry,
+    required this.engines,
+    this.hooks,
+  });
+
+  /// Full profile application pipeline per §4.
+  ///
+  /// Pipeline:
+  /// 1. Load profile from registry
+  /// 2. Compute appraisal metrics via AppraisalPort
+  /// 3. Get decision guidance via DecisionPort
+  /// 4. Get expression style via ExpressionPort
+  /// 5. Format content if provided via ExpressionPort
+  Future<ProfileApplicationResult> apply(
+    RuntimeProfileContext context, {
+    String? rawContent,
+  }) async {
+    final startTime = context.clock.now();
+
+    await _callHooks('beforeApply', context);
+
+    // 1. Load profile
+    final profile = registry.get(context.profileId);
+    if (profile == null) {
+      throw ProfileNotFoundException(context.profileId);
     }
-    return content;
+
+    // 2. Compute appraisal
+    final appraisal = await appraise(context, profile: profile);
+    await _callHooks('afterAppraise', context, appraisal: appraisal);
+
+    // 3. Get decision guidance
+    var decision = await getDecisionGuidance(appraisal, context, profile: profile);
+
+    // §9.3 step 4: Add implicit require_evidence modifier for low-confidence metrics
+    if (appraisal.metadata.metricsRequiringEvidence.isNotEmpty) {
+      final hasEvidenceModifier =
+          decision.modifiers.any((m) => m.type == ModifierType.requireEvidence);
+      if (!hasEvidenceModifier) {
+        decision = DecisionGuidance(
+          action: decision.action,
+          confidence: decision.confidence,
+          explanation: decision.explanation,
+          modifiers: [
+            ...decision.modifiers,
+            DecisionModifier.requireEvidence(
+              minSources: 2,
+              evidenceTypes: null,
+            ),
+          ],
+          metadata: {
+            ...?decision.metadata,
+            'implicitEvidenceReason': 'Low confidence metrics: '
+                '${appraisal.metadata.metricsRequiringEvidence.join(', ')}',
+          },
+        );
+      }
+    }
+    await _callHooks('afterDecision', context, decision: decision);
+
+    // 4. Get expression style
+    final expression = await getExpressionStyle(appraisal, context, profile: profile);
+
+    // 5. Format content if provided
+    FormattedResponse? formatted;
+    if (rawContent != null) {
+      formatted = await applyExpression(rawContent, expression, context);
+    }
+
+    await _callHooks('afterApply', context);
+
+    return ProfileApplicationResult(
+      profileId: context.profileId,
+      contextId: context.contextId,
+      appraisal: appraisal,
+      decision: decision,
+      expression: expression,
+      formatted: formatted,
+      metadata: ProfileApplicationMetadata(
+        startedAt: startTime,
+        completedAt: context.clock.now(),
+        profileVersion: profile.version,
+      ),
+    );
+  }
+
+  /// Compute appraisal metrics per §4 step 2.
+  ///
+  /// Uses AppraisalPort.computeMetrics() and MetricResultConverter.convertBatch()
+  /// per design/02-ports.md §4.2.
+  Future<AppraisalResult> appraise(
+    RuntimeProfileContext context, {
+    Profile? profile,
+  }) async {
+    profile ??= registry.get(context.profileId);
+    if (profile == null) {
+      throw ProfileNotFoundException(context.profileId);
+    }
+
+    // Get appraisal section from profile metadata
+    final appraisalSection = profile.getAppraisalSection();
+    if (appraisalSection == null) {
+      // No appraisal defined, return empty result
+      return AppraisalResult(
+        profileId: context.profileId,
+        contextId: context.contextId,
+        asOf: context.asOf,
+        metrics: const {},
+        aggregatedScore: 1.0,
+        metadata: AppraisalMetadata(
+          computedAt: context.clock.now(),
+        ),
+      );
+    }
+
+    final startTime = context.clock.now();
+
+    // Compute metrics using port
+    final computeResults = await engines.appraisal.computeMetrics(
+      appraisalSection.metrics,
+      context,
+    );
+
+    // Convert MetricComputeResult -> MetricResult using batch converter
+    final converted = MetricResultConverter.convertBatch(
+      computeResults,
+      defaultValues: {
+        for (final m in appraisalSection.metrics)
+          if (m.defaultValue != null) m.id: m.defaultValue!,
+      },
+    );
+
+    // Compute aggregate score
+    final aggregatedScore = await engines.appraisal.computeAggregate(
+      computeResults,
+      appraisalSection.aggregation,
+    );
+
+    return AppraisalResult(
+      profileId: context.profileId,
+      contextId: context.contextId,
+      asOf: context.asOf,
+      metrics: converted.results,
+      aggregatedScore: aggregatedScore,
+      metadata: AppraisalMetadata(
+        computedAt: context.clock.now(),
+        durationMs: context.clock.now().difference(startTime).inMilliseconds,
+        lowConfidenceMetrics: converted.results.entries
+            .where((e) => e.value.confidence < 0.5)
+            .map((e) => e.key)
+            .toList(),
+        warnings: converted.warnings,
+      ),
+    );
+  }
+
+  /// Get decision guidance per §4 step 3.
+  ///
+  /// Uses DecisionPort.evaluate() per design/02-ports.md §5.
+  Future<DecisionGuidance> getDecisionGuidance(
+    AppraisalResult appraisal,
+    RuntimeProfileContext context, {
+    Profile? profile,
+  }) async {
+    profile ??= registry.get(context.profileId);
+    if (profile == null) {
+      throw ProfileNotFoundException(context.profileId);
+    }
+
+    // Get decision policies from profile metadata
+    final decisionSection = profile.getDecisionSection();
+    if (decisionSection == null || decisionSection.policies.isEmpty) {
+      return DecisionGuidance.defaultProceed;
+    }
+
+    // Evaluate policies using port
+    return engines.decision.evaluate(
+      decisionSection.policies,
+      appraisal,
+      context,
+    );
+  }
+
+  /// Get expression style per §4 step 4.
+  ///
+  /// Uses ExpressionPort.evaluateCondition() per design/02-ports.md §6.
+  Future<ExpressionStyle> getExpressionStyle(
+    AppraisalResult appraisal,
+    RuntimeProfileContext context, {
+    Profile? profile,
+  }) async {
+    profile ??= registry.get(context.profileId);
+    if (profile == null) {
+      throw ProfileNotFoundException(context.profileId);
+    }
+
+    // Get expression policies from profile metadata
+    final expressionSection = profile.getExpressionSection();
+    if (expressionSection == null || expressionSection.policies.isEmpty) {
+      return ExpressionStyle.defaultStyle;
+    }
+
+    // Sort by priority and find matching policy
+    final policies = [...expressionSection.policies]
+      ..sort((a, b) => b.priority.compareTo(a.priority));
+
+    for (final policy in policies) {
+      if (!policy.enabled) continue;
+
+      final matches = await engines.expression.evaluateCondition(
+        policy.condition,
+        appraisal,
+        context,
+      );
+
+      if (matches) {
+        var resultStyle = policy.style;
+
+        // Apply globalOverrides if configured
+        if (expressionSection.globalOverrides != null) {
+          resultStyle = _mergeWithOverrides(resultStyle, expressionSection.globalOverrides!);
+        }
+
+        return resultStyle;
+      }
+    }
+
+    // Return default if configured, otherwise default style
+    ExpressionStyle resultStyle;
+    if (expressionSection.defaultPolicy != null) {
+      final defaultPolicy = policies.firstWhere(
+        (p) => p.id == expressionSection.defaultPolicy,
+        orElse: () => throw PolicyNotFoundException(
+          expressionSection.defaultPolicy!,
+        ),
+      );
+      resultStyle = defaultPolicy.style;
+    } else {
+      resultStyle = ExpressionStyle.defaultStyle;
+    }
+
+    // Apply globalOverrides if configured
+    if (expressionSection.globalOverrides != null) {
+      resultStyle = _mergeWithOverrides(resultStyle, expressionSection.globalOverrides!);
+    }
+
+    return resultStyle;
+  }
+
+  /// Merge an ExpressionStyle with globalOverrides per design/03-runtime.md §4.
+  ExpressionStyle _mergeWithOverrides(
+    ExpressionStyle base,
+    ExpressionStyle overrides,
+  ) {
+    return ExpressionStyle(
+      tone: ToneConfig(
+        formality: overrides.tone.formality,
+        confidence: overrides.tone.confidence,
+        empathy: overrides.tone.empathy,
+        directness: overrides.tone.directness,
+      ),
+      format: FormatConfig(
+        structure: overrides.format.structure,
+        length: overrides.format.length,
+        includeEvidence: overrides.format.includeEvidence,
+        includeCaveats: overrides.format.includeCaveats,
+        includeAlternatives: overrides.format.includeAlternatives,
+      ),
+      hedging: overrides.hedging ?? base.hedging,
+      audience: overrides.audience ?? base.audience,
+      language: overrides.language ?? base.language,
+    );
+  }
+
+  /// Apply expression style to content per §4 step 5.
+  ///
+  /// Uses ExpressionPort.format() per design/02-ports.md §6.
+  Future<FormattedResponse> applyExpression(
+    String rawContent,
+    ExpressionStyle style,
+    RuntimeProfileContext context,
+  ) async {
+    return engines.expression.format(rawContent, style, context);
+  }
+
+  Future<void> _callHooks(
+    String event,
+    RuntimeProfileContext context, {
+    AppraisalResult? appraisal,
+    DecisionGuidance? decision,
+  }) async {
+    if (hooks == null) return;
+
+    for (final hook in hooks!) {
+      await hook.call(event, context, appraisal: appraisal, decision: decision);
+    }
   }
 }
+
+// =============================================================================
+// Profile Extensions for Spec Sections
+// =============================================================================
+
+/// Extension to extract appraisal/decision/expression sections from Profile.
+///
+/// Sections are stored in profile.metadata under reserved keys:
+/// - '_appraisal': AppraisalSection configuration
+/// - '_decision': DecisionPolicySection configuration
+/// - '_expression': ExpressionPolicySection configuration
+extension ProfileSpecSections on Profile {
+  /// Get appraisal section from metadata.
+  AppraisalSection? getAppraisalSection() {
+    final data = metadata['_appraisal'];
+    if (data is AppraisalSection) {
+      return data;
+    }
+    if (data is Map<String, dynamic>) {
+      return AppraisalSection.fromJson(data);
+    }
+    return null;
+  }
+
+  /// Get decision policy section from metadata.
+  DecisionPolicySection? getDecisionSection() {
+    final data = metadata['_decision'];
+    if (data is DecisionPolicySection) {
+      return data;
+    }
+    if (data is Map<String, dynamic>) {
+      return DecisionPolicySection.fromJson(data);
+    }
+    return null;
+  }
+
+  /// Get expression policy section from metadata.
+  ExpressionPolicySection? getExpressionSection() {
+    final data = metadata['_expression'];
+    if (data is ExpressionPolicySection) {
+      return data;
+    }
+    if (data is Map<String, dynamic>) {
+      return ExpressionPolicySection.fromJson(data);
+    }
+    return null;
+  }
+}
+
+// =============================================================================
+// Hooks (§6)
+// =============================================================================
+
+/// Hook for runtime events per design/03-runtime.md §6.
+abstract class ProfileRuntimeHook {
+  Future<void> call(
+    String event,
+    RuntimeProfileContext context, {
+    AppraisalResult? appraisal,
+    DecisionGuidance? decision,
+  });
+}
+
+/// Alias for backward compatibility.
+typedef ProfileApplicationHook = ProfileRuntimeHook;
+
+/// No-op hook for default behavior.
+class NoOpApplicationHook implements ProfileRuntimeHook {
+  const NoOpApplicationHook();
+
+  @override
+  Future<void> call(
+    String event,
+    RuntimeProfileContext context, {
+    AppraisalResult? appraisal,
+    DecisionGuidance? decision,
+  }) async {}
+}
+
+// =============================================================================
+// Exceptions
+// =============================================================================
+
+/// Exception thrown when a profile is not found.
+class ProfileNotFoundException implements Exception {
+  final String profileId;
+
+  const ProfileNotFoundException(this.profileId);
+
+  @override
+  String toString() => 'ProfileNotFoundException: Profile not found: $profileId';
+}
+
+/// Exception thrown when a policy is not found.
+class PolicyNotFoundException implements Exception {
+  final String policyId;
+
+  const PolicyNotFoundException(this.policyId);
+
+  @override
+  String toString() => 'PolicyNotFoundException: Policy not found: $policyId';
+}
+

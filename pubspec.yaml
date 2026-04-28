@@ -1,10 +1,9 @@
 name: mcp_profile
 description: AI persona definitions with template rendering, context injection, profile selection, and appraisal scoring for the MCP ecosystem.
-version: 0.1.0
+version: 0.2.0
 homepage: https://app-appplayer.github.io/makemind
 repository: https://github.com/app-appplayer/mcp_profile
 issue_tracker: https://github.com/app-appplayer/mcp_profile/issues
-documentation: https://github.com/app-appplayer/mcp_profile/wiki
 
 topics:
   - ai-personas
@@ -18,7 +17,7 @@ environment:
 
 dependencies:
   meta: ^1.9.0
-  mcp_bundle: ^0.1.0
+  mcp_bundle: ^0.3.0
 
 dev_dependencies:
   lints: ^3.0.0
@@ -33,6 +32,3 @@ platforms:
   macos:
   web:
   windows:
-
-funding:
-  - https://www.patreon.com/mcpdevstudio
